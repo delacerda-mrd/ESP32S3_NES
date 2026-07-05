@@ -62,6 +62,9 @@ typedef enum
 #endif
 #endif /* !__cplusplus */
 
+/* stdlib.h must be included before memguard.h so its malloc/free/calloc
+   prototypes are fully declared before those names become macros below */
+#include <stdlib.h>
 #include <memguard.h>
 #include <log.h>
 

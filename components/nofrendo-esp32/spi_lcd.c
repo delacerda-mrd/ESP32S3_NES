@@ -1,434 +1,231 @@
-// Copyright 2015-2016 Espressif Systems (Shanghai) PTE LTD
+// LCD driver for ILI9341V (QDtech ES3C28P), using esp_lcd over SPI2.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// RST is tied to the chip's own reset line on this board -- never toggled here.
 
 #include <string.h>
 #include <stdio.h>
 #include "sdkconfig.h"
-#include "rom/ets_sys.h"
-#include "rom/gpio.h"
-#include "soc/gpio_reg.h"
-#include "soc/gpio_sig_map.h"
-#include "soc/gpio_struct.h"
-#include "soc/io_mux_reg.h"
-#include "soc/spi_reg.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/periph_ctrl.h"
+#include "freertos/semphr.h"
+#include "esp_heap_caps.h"
+#include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_io_spi.h"
 #include "spi_lcd.h"
 
-#define PIN_NUM_MISO CONFIG_HW_LCD_MISO_GPIO
-#define PIN_NUM_MOSI CONFIG_HW_LCD_MOSI_GPIO
-#define PIN_NUM_CLK  CONFIG_HW_LCD_CLK_GPIO
-#define PIN_NUM_CS   CONFIG_HW_LCD_CS_GPIO
-#define PIN_NUM_DC   CONFIG_HW_LCD_DC_GPIO
-#define PIN_NUM_RST  CONFIG_HW_LCD_RESET_GPIO
-#define PIN_NUM_BCKL CONFIG_HW_LCD_BL_GPIO
-#define LCD_SEL_CMD()   GPIO.out_w1tc = (1 << PIN_NUM_DC) // Low to send command 
-#define LCD_SEL_DATA()  GPIO.out_w1ts = (1 << PIN_NUM_DC) // High to send data
-#define LCD_RST_SET()   GPIO.out_w1ts = (1 << PIN_NUM_RST) 
-#define LCD_RST_CLR()   GPIO.out_w1tc = (1 << PIN_NUM_RST)
+#define PIN_NUM_CS    10
+#define PIN_NUM_DC    46
+#define PIN_NUM_SCLK  12
+#define PIN_NUM_MOSI  11
+#define PIN_NUM_MISO  13
+#define PIN_NUM_BCKL  45
 
-#if CONFIG_HW_INV_BL
-#define LCD_BKG_ON()    GPIO.out_w1tc = (1 << PIN_NUM_BCKL) // Backlight ON
-#define LCD_BKG_OFF()   GPIO.out_w1ts = (1 << PIN_NUM_BCKL) //Backlight OFF
-#else
-#define LCD_BKG_ON()    GPIO.out_w1ts = (1 << PIN_NUM_BCKL) // Backlight ON
-#define LCD_BKG_OFF()   GPIO.out_w1tc = (1 << PIN_NUM_BCKL) //Backlight OFF
-#endif
+#define LCD_SPI_HOST  SPI2_HOST
+#define LCD_PCLK_HZ   (40 * 1000 * 1000)
 
-#define SPI_NUM  0x3
+#define LCD_WIDTH     320
+#define LCD_HEIGHT    240
 
-#define LCD_TYPE_ILI 0
-#define LCD_TYPE_ST 1
+#define PARALLEL_LINES 16
 
+static esp_lcd_panel_io_handle_t io_handle;
+static uint16_t *line_buf[2];
+static SemaphoreHandle_t buf_free_sem;
 
-static void spi_write_byte(const uint8_t data){
-    SET_PERI_REG_BITS(SPI_MOSI_DLEN_REG(SPI_NUM), SPI_USR_MOSI_DBITLEN, 0x7, SPI_USR_MOSI_DBITLEN_S);
-    WRITE_PERI_REG((SPI_W0_REG(SPI_NUM)), data);
-    SET_PERI_REG_MASK(SPI_CMD_REG(SPI_NUM), SPI_USR);
-    while (READ_PERI_REG(SPI_CMD_REG(SPI_NUM))&SPI_USR);
+typedef struct {
+    uint8_t cmd;
+    uint8_t data[16];
+    uint8_t len;
+    uint16_t delay_ms;
+} lcd_init_cmd_t;
+
+static const lcd_init_cmd_t ili9341v_init_seq[] = {
+    {0xCF, {0x00, 0xC1, 0x30}, 3, 0},
+    {0xED, {0x64, 0x03, 0x12, 0x81}, 4, 0},
+    {0xE8, {0x85, 0x00, 0x78}, 3, 0},
+    {0xCB, {0x39, 0x2C, 0x00, 0x34, 0x02}, 5, 0},
+    {0xF7, {0x20}, 1, 0},
+    {0xEA, {0x00, 0x00}, 2, 0},
+    {0xC0, {0x13}, 1, 0},
+    {0xC1, {0x13}, 1, 0},
+    {0xC5, {0x22, 0x35}, 2, 0},
+    {0xC7, {0xBD}, 1, 0},
+    {0x21, {0}, 0, 0},                 // Display inversion ON (required for IPS)
+    {0x36, {0x68}, 1, 0},              // MADCTL: landscape, BGR
+    {0xB6, {0x0A, 0xA2}, 2, 0},
+    {0x3A, {0x55}, 1, 0},              // 16-bit RGB565
+    {0xF6, {0x01, 0x30}, 2, 0},
+    {0xB1, {0x00, 0x1B}, 2, 0},
+    {0xF2, {0x00}, 1, 0},
+    {0x26, {0x01}, 1, 0},
+    {0xE0, {0x0F, 0x35, 0x31, 0x0B, 0x0E, 0x06, 0x49, 0xA7, 0x33, 0x07, 0x0F, 0x03, 0x0C, 0x0A, 0x00}, 15, 0},
+    {0xE1, {0x00, 0x0A, 0x0F, 0x04, 0x11, 0x08, 0x36, 0x58, 0x4D, 0x07, 0x10, 0x0C, 0x32, 0x34, 0x0F}, 15, 0},
+    {0x11, {0}, 0, 120},               // Exit sleep
+    {0x29, {0}, 0, 0},                 // Display on
+};
+
+static bool color_trans_done(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
+{
+    BaseType_t hp_task_woken = pdFALSE;
+    xSemaphoreGiveFromISR(buf_free_sem, &hp_task_woken);
+    return hp_task_woken == pdTRUE;
 }
 
-static void LCD_WriteCommand(const uint8_t cmd)
+static void set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 {
-    LCD_SEL_CMD();
-    spi_write_byte(cmd);
+    uint8_t caset[4] = { x0 >> 8, x0 & 0xFF, x1 >> 8, x1 & 0xFF };
+    uint8_t raset[4] = { y0 >> 8, y0 & 0xFF, y1 >> 8, y1 & 0xFF };
+    esp_lcd_panel_io_tx_param(io_handle, 0x2A, caset, 4);
+    esp_lcd_panel_io_tx_param(io_handle, 0x2B, raset, 4);
 }
 
-static void LCD_WriteData(const uint8_t data)
+// Sends `count` pixels of a single (already byte-swapped) color, using the window
+// previously set by the caller. First chunk includes the RAMWR command.
+static void send_solid_pixels(uint16_t swapped_color, uint32_t count)
 {
-    LCD_SEL_DATA();
-    spi_write_byte(data);
-}
+    uint32_t max_px = LCD_WIDTH * PARALLEL_LINES;
+    for (int i = 0; i < 2; i++) {
+        uint32_t n = count < max_px ? count : max_px;
+        for (uint32_t p = 0; p < n; p++) line_buf[i][p] = swapped_color;
+    }
 
-static void  ILI9341_INITIAL ()
-{
-    LCD_BKG_ON();
-    //------------------------------------Reset Sequence-----------------------------------------//
-
-    LCD_RST_SET();
-    ets_delay_us(100000);                                                              
-
-    LCD_RST_CLR();
-    ets_delay_us(200000);                                                              
-
-    LCD_RST_SET();
-    ets_delay_us(200000);                                                             
-
-
-#if (CONFIG_HW_LCD_TYPE == LCD_TYPE_ILI)
-    //************* Start Initial Sequence **********//
-    LCD_WriteCommand(0xCF);
-    LCD_WriteData(0x00);
-    LCD_WriteData(0x83);
-    LCD_WriteData(0X30);
-
-    LCD_WriteCommand(0xED);
-    LCD_WriteData(0x64);
-    LCD_WriteData(0x03);
-    LCD_WriteData(0X12);
-    LCD_WriteData(0X81);
-
-    LCD_WriteCommand(0xE8);
-    LCD_WriteData(0x85);
-    LCD_WriteData(0x01); //i
-    LCD_WriteData(0x79); //i
-
-    LCD_WriteCommand(0xCB);
-    LCD_WriteData(0x39);
-    LCD_WriteData(0x2C);
-    LCD_WriteData(0x00);
-    LCD_WriteData(0x34);
-    LCD_WriteData(0x02);
-
-    LCD_WriteCommand(0xF7);
-    LCD_WriteData(0x20);
-
-    LCD_WriteCommand(0xEA);
-    LCD_WriteData(0x00);
-    LCD_WriteData(0x00);
-
-    LCD_WriteCommand(0xC0);    //Power control
-    LCD_WriteData(0x26); //i  //VRH[5:0]
-
-    LCD_WriteCommand(0xC1);    //Power control
-    LCD_WriteData(0x11);   //i //SAP[2:0];BT[3:0]
-
-    LCD_WriteCommand(0xC5);    //VCM control
-    LCD_WriteData(0x35); //i
-    LCD_WriteData(0x3E); //i
-
-    LCD_WriteCommand(0xC7);    //VCM control2
-    LCD_WriteData(0xBE); //i   //»òÕß B1h
-
-    LCD_WriteCommand(0x36);    // Memory Access Control
-    LCD_WriteData(0x28); //i //was 0x48
-
-    LCD_WriteCommand(0x3A);
-    LCD_WriteData(0x55);
-
-    LCD_WriteCommand(0xB1);
-    LCD_WriteData(0x00);
-    LCD_WriteData(0x1B); //18
-    
-    LCD_WriteCommand(0xF2);    // 3Gamma Function Disable
-    LCD_WriteData(0x08);
-
-    LCD_WriteCommand(0x26);    //Gamma curve selected
-    LCD_WriteData(0x01);
-        
-    LCD_WriteCommand(0xE0);    //Set Gamma
-    LCD_WriteData(0x1F);
-    LCD_WriteData(0x1A);
-    LCD_WriteData(0x18);
-    LCD_WriteData(0x0A);
-    LCD_WriteData(0x0F);
-    LCD_WriteData(0x06);
-    LCD_WriteData(0x45);
-    LCD_WriteData(0X87);
-    LCD_WriteData(0x32);
-    LCD_WriteData(0x0A);
-    LCD_WriteData(0x07);
-    LCD_WriteData(0x02);
-    LCD_WriteData(0x07);
-    LCD_WriteData(0x05);
-    LCD_WriteData(0x00);
- 
-    LCD_WriteCommand(0XE1);    //Set Gamma
-    LCD_WriteData(0x00);
-    LCD_WriteData(0x25);
-    LCD_WriteData(0x27);
-    LCD_WriteData(0x05);
-    LCD_WriteData(0x10);
-    LCD_WriteData(0x09);
-    LCD_WriteData(0x3A);
-    LCD_WriteData(0x78);
-    LCD_WriteData(0x4D);
-    LCD_WriteData(0x05);
-    LCD_WriteData(0x18);
-    LCD_WriteData(0x0D);
-    LCD_WriteData(0x38);
-    LCD_WriteData(0x3A);
-    LCD_WriteData(0x1F);
-
-    LCD_WriteCommand(0x2A);
-    LCD_WriteData(0x00);
-    LCD_WriteData(0x00);
-    LCD_WriteData(0x00);
-    LCD_WriteData(0xEF);
-
-    LCD_WriteCommand(0x2B);
-    LCD_WriteData(0x00);
-    LCD_WriteData(0x00);
-    LCD_WriteData(0x01);
-    LCD_WriteData(0x3f);
-    LCD_WriteCommand(0x2C);
-    
-    LCD_WriteCommand(0xB7); 
-    LCD_WriteData(0x07); 
-    
-    LCD_WriteCommand(0xB6);    // Display Function Control
-    LCD_WriteData(0x0A); //8 82 27
-    LCD_WriteData(0x82);
-    LCD_WriteData(0x27);
-    LCD_WriteData(0x00);
-
-    //LCD_WriteCommand(0xF6); //not there
-    //LCD_WriteData(0x01);
-    //LCD_WriteData(0x30);
-
-#endif
-#if (CONFIG_HW_LCD_TYPE == LCD_TYPE_ST)
-
-//212
-//122
-    LCD_WriteCommand(0x36);
-    LCD_WriteData((1<<5)|(1<<6)); //MV 1, MX 1
-
-    LCD_WriteCommand(0x3A);
-    LCD_WriteData(0x55);
-
-    LCD_WriteCommand(0xB2);
-    LCD_WriteData(0x0c);
-    LCD_WriteData(0x0c);
-    LCD_WriteData(0x00);
-    LCD_WriteData(0x33);
-    LCD_WriteData(0x33);
-
-    LCD_WriteCommand(0xB7);
-    LCD_WriteData(0x35);
-
-    LCD_WriteCommand(0xBB);
-    LCD_WriteData(0x2B);
-
-    LCD_WriteCommand(0xC0);
-    LCD_WriteData(0x2C);
-
-    LCD_WriteCommand(0xC2);
-    LCD_WriteData(0x01);
-    LCD_WriteData(0xFF);
-
-    LCD_WriteCommand(0xC3);
-    LCD_WriteData(0x11);
-
-    LCD_WriteCommand(0xC4);
-    LCD_WriteData(0x20);
-
-    LCD_WriteCommand(0xC6);
-    LCD_WriteData(0x0f);
-
-    LCD_WriteCommand(0xD0);
-    LCD_WriteData(0xA4);
-    LCD_WriteData(0xA1);
-
-    LCD_WriteCommand(0xE0);
-    LCD_WriteData(0xD0);
-    LCD_WriteData(0x00);
-    LCD_WriteData(0x05);
-    LCD_WriteData(0x0E);
-    LCD_WriteData(0x15);
-    LCD_WriteData(0x0D);
-    LCD_WriteData(0x37);
-    LCD_WriteData(0x43);
-    LCD_WriteData(0x47);
-    LCD_WriteData(0x09);
-    LCD_WriteData(0x15);
-    LCD_WriteData(0x12);
-    LCD_WriteData(0x16);
-    LCD_WriteData(0x19);
-
-    LCD_WriteCommand(0xE1);
-    LCD_WriteData(0xD0);
-    LCD_WriteData(0x00);
-    LCD_WriteData(0x05);
-    LCD_WriteData(0x0D);
-    LCD_WriteData(0x0C);
-    LCD_WriteData(0x06);
-    LCD_WriteData(0x2D);
-    LCD_WriteData(0x44);
-    LCD_WriteData(0x40);
-    LCD_WriteData(0x0E);
-    LCD_WriteData(0x1C);
-    LCD_WriteData(0x18);
-    LCD_WriteData(0x16);
-    LCD_WriteData(0x19);
-
-#endif
-
-
-    LCD_WriteCommand(0x11);    //Exit Sleep
-    ets_delay_us(100000);
-    LCD_WriteCommand(0x29);    //Display on
-    ets_delay_us(100000);
-
-
-}
-//.............LCD API END----------
-
-static void ili_gpio_init()
-{
-    PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO21_U,2);   //DC PIN
-    PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO18_U,2);   //RESET PIN
-    PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO5_U,2);    //BKL PIN
-    WRITE_PERI_REG(GPIO_ENABLE_W1TS_REG, BIT21|BIT18|BIT5);
-}
-
-static void spi_master_init()
-{
-    periph_module_enable(PERIPH_VSPI_MODULE);
-    periph_module_enable(PERIPH_SPI_DMA_MODULE);
-
-    ets_printf("lcd spi pin mux init ...\r\n");
-    PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO19_U,2);
-    PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO23_U,2);
-    PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO22_U,2);
-    PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO25_U,2);
-    WRITE_PERI_REG(GPIO_ENABLE_W1TS_REG, BIT19|BIT23|BIT22);
-
-    ets_printf("lcd spi signal init\r\n");
-    gpio_matrix_in(PIN_NUM_MISO, VSPIQ_IN_IDX,0);
-    gpio_matrix_out(PIN_NUM_MOSI, VSPID_OUT_IDX,0,0);
-    gpio_matrix_out(PIN_NUM_CLK, VSPICLK_OUT_IDX,0,0);
-    gpio_matrix_out(PIN_NUM_CS, VSPICS0_OUT_IDX,0,0);
-    ets_printf("Hspi config\r\n");
-
-    CLEAR_PERI_REG_MASK(SPI_SLAVE_REG(SPI_NUM), SPI_TRANS_DONE << 5);
-    SET_PERI_REG_MASK(SPI_USER_REG(SPI_NUM), SPI_CS_SETUP);
-    CLEAR_PERI_REG_MASK(SPI_PIN_REG(SPI_NUM), SPI_CK_IDLE_EDGE);
-    CLEAR_PERI_REG_MASK(SPI_USER_REG(SPI_NUM),  SPI_CK_OUT_EDGE);
-    CLEAR_PERI_REG_MASK(SPI_CTRL_REG(SPI_NUM), SPI_WR_BIT_ORDER);
-    CLEAR_PERI_REG_MASK(SPI_CTRL_REG(SPI_NUM), SPI_RD_BIT_ORDER);
-    CLEAR_PERI_REG_MASK(SPI_USER_REG(SPI_NUM), SPI_DOUTDIN);
-    WRITE_PERI_REG(SPI_USER1_REG(SPI_NUM), 0);
-    SET_PERI_REG_BITS(SPI_CTRL2_REG(SPI_NUM), SPI_MISO_DELAY_MODE, 0, SPI_MISO_DELAY_MODE_S);
-    CLEAR_PERI_REG_MASK(SPI_SLAVE_REG(SPI_NUM), SPI_SLAVE_MODE);
-    
-    WRITE_PERI_REG(SPI_CLOCK_REG(SPI_NUM), (1 << SPI_CLKCNT_N_S) | (1 << SPI_CLKCNT_L_S));//40MHz
-    //WRITE_PERI_REG(SPI_CLOCK_REG(SPI_NUM), SPI_CLK_EQU_SYSCLK); // 80Mhz
-    
-    SET_PERI_REG_MASK(SPI_USER_REG(SPI_NUM), SPI_CS_SETUP | SPI_CS_HOLD | SPI_USR_MOSI);
-    SET_PERI_REG_MASK(SPI_CTRL2_REG(SPI_NUM), ((0x4 & SPI_MISO_DELAY_NUM) << SPI_MISO_DELAY_NUM_S));
-    CLEAR_PERI_REG_MASK(SPI_USER_REG(SPI_NUM), SPI_USR_COMMAND);
-    SET_PERI_REG_BITS(SPI_USER2_REG(SPI_NUM), SPI_USR_COMMAND_BITLEN, 0, SPI_USR_COMMAND_BITLEN_S);
-    CLEAR_PERI_REG_MASK(SPI_USER_REG(SPI_NUM), SPI_USR_ADDR);
-    SET_PERI_REG_BITS(SPI_USER1_REG(SPI_NUM), SPI_USR_ADDR_BITLEN, 0, SPI_USR_ADDR_BITLEN_S);
-    CLEAR_PERI_REG_MASK(SPI_USER_REG(SPI_NUM), SPI_USR_MISO);
-    SET_PERI_REG_MASK(SPI_USER_REG(SPI_NUM), SPI_USR_MOSI);
-    char i;
-    for (i = 0; i < 16; ++i) {
-        WRITE_PERI_REG((SPI_W0_REG(SPI_NUM) + (i << 2)), 0);
+    bool first = true;
+    while (count > 0) {
+        uint32_t n = count < max_px ? count : max_px;
+        int idx = first ? 0 : 1;
+        xSemaphoreTake(buf_free_sem, portMAX_DELAY);
+        esp_lcd_panel_io_tx_color(io_handle, first ? 0x2C : -1, line_buf[idx], n * 2);
+        first = false;
+        count -= n;
     }
 }
 
-#define U16x2toU32(m,l) ((((uint32_t)(l>>8|(l&0xFF)<<8))<<16)|(m>>8|(m&0xFF)<<8))
+void ili9341_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t rgb565)
+{
+    uint16_t swapped = (rgb565 >> 8) | (rgb565 << 8);
+    set_window(x, y, x + w - 1, y + h - 1);
+    send_solid_pixels(swapped, (uint32_t)w * h);
+}
 
-extern uint16_t myPalette[];
+void ili9341_write_frame(uint16_t xs, uint16_t ys, uint16_t width, uint16_t height, const uint8_t *data[])
+{
+    extern uint16_t myPalette[];
 
-void ili9341_write_frame(const uint16_t xs, const uint16_t ys, const uint16_t width, const uint16_t height, const uint8_t * data[]){
-    int x, y;
-    int i;
-    uint16_t x1, y1;
-    uint32_t xv, yv, dc;
-    uint32_t temp[16];
-    dc = (1 << PIN_NUM_DC);
-    
-    for (y=0; y<height; y++) {
-        //start line
-        x1 = xs+(width-1);
-        y1 = ys+y+(height-1);
-        xv = U16x2toU32(xs,x1);
-        yv = U16x2toU32((ys+y),y1);
-        
-        while (READ_PERI_REG(SPI_CMD_REG(SPI_NUM))&SPI_USR);
-        GPIO.out_w1tc = dc;
-        SET_PERI_REG_BITS(SPI_MOSI_DLEN_REG(SPI_NUM), SPI_USR_MOSI_DBITLEN, 7, SPI_USR_MOSI_DBITLEN_S);
-        WRITE_PERI_REG((SPI_W0_REG(SPI_NUM)), 0x2A);
-        SET_PERI_REG_MASK(SPI_CMD_REG(SPI_NUM), SPI_USR);
-        while (READ_PERI_REG(SPI_CMD_REG(SPI_NUM))&SPI_USR);
-        GPIO.out_w1ts = dc;
-        SET_PERI_REG_BITS(SPI_MOSI_DLEN_REG(SPI_NUM), SPI_USR_MOSI_DBITLEN, 31, SPI_USR_MOSI_DBITLEN_S);
-        WRITE_PERI_REG((SPI_W0_REG(SPI_NUM)), xv);
-        SET_PERI_REG_MASK(SPI_CMD_REG(SPI_NUM), SPI_USR);
-        while (READ_PERI_REG(SPI_CMD_REG(SPI_NUM))&SPI_USR);
-        GPIO.out_w1tc = dc;
-        SET_PERI_REG_BITS(SPI_MOSI_DLEN_REG(SPI_NUM), SPI_USR_MOSI_DBITLEN, 7, SPI_USR_MOSI_DBITLEN_S);
-        WRITE_PERI_REG((SPI_W0_REG(SPI_NUM)), 0x2B);
-        SET_PERI_REG_MASK(SPI_CMD_REG(SPI_NUM), SPI_USR);
-        while (READ_PERI_REG(SPI_CMD_REG(SPI_NUM))&SPI_USR);
-        GPIO.out_w1ts = dc;
-        SET_PERI_REG_BITS(SPI_MOSI_DLEN_REG(SPI_NUM), SPI_USR_MOSI_DBITLEN, 31, SPI_USR_MOSI_DBITLEN_S);
-        WRITE_PERI_REG((SPI_W0_REG(SPI_NUM)), yv);
-        SET_PERI_REG_MASK(SPI_CMD_REG(SPI_NUM), SPI_USR);
-        while (READ_PERI_REG(SPI_CMD_REG(SPI_NUM))&SPI_USR);
-        GPIO.out_w1tc = dc;
-        SET_PERI_REG_BITS(SPI_MOSI_DLEN_REG(SPI_NUM), SPI_USR_MOSI_DBITLEN, 7, SPI_USR_MOSI_DBITLEN_S);
-        WRITE_PERI_REG((SPI_W0_REG(SPI_NUM)), 0x2C);
-        SET_PERI_REG_MASK(SPI_CMD_REG(SPI_NUM), SPI_USR);
-        while (READ_PERI_REG(SPI_CMD_REG(SPI_NUM))&SPI_USR);
-        
-        x = 0;
-        GPIO.out_w1ts = dc;
-        SET_PERI_REG_BITS(SPI_MOSI_DLEN_REG(SPI_NUM), SPI_USR_MOSI_DBITLEN, 511, SPI_USR_MOSI_DBITLEN_S);
-        while (x<width) {
-            for (i=0; i<16; i++) {
-                if(data == NULL){
-                    temp[i] = 0;
-                    x += 2;
-                    continue;
+    if (data == NULL) {
+        ili9341_fill_rect(xs, ys, width, height, 0);
+        return;
+    }
+
+    set_window(xs, ys, xs + width - 1, ys + height - 1);
+
+    bool first = true;
+    for (int y = 0; y < height; y += PARALLEL_LINES) {
+        int lines = (height - y < PARALLEL_LINES) ? (height - y) : PARALLEL_LINES;
+        int idx = (y / PARALLEL_LINES) % 2;
+        uint16_t *buf = line_buf[idx];
+
+        xSemaphoreTake(buf_free_sem, portMAX_DELAY);
+        for (int ly = 0; ly < lines; ly++) {
+            const uint8_t *src = data[y + ly];
+            uint16_t *dst = buf + (size_t)ly * width;
+            for (int x = 0; x < width; x++) dst[x] = myPalette[src[x]];
+        }
+        esp_lcd_panel_io_tx_color(io_handle, first ? 0x2C : -1, buf, (size_t)lines * width * 2);
+        first = false;
+    }
+}
+
+static void backlight_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << PIN_NUM_BCKL,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(PIN_NUM_BCKL, 1);
+}
+
+void ili9341_init(void)
+{
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = PIN_NUM_MOSI,
+        .miso_io_num = PIN_NUM_MISO,
+        .sclk_io_num = PIN_NUM_SCLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = LCD_WIDTH * 2 * PARALLEL_LINES,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
+
+    esp_lcd_panel_io_spi_config_t io_config = {
+        .cs_gpio_num = PIN_NUM_CS,
+        .dc_gpio_num = PIN_NUM_DC,
+        .spi_mode = 0,
+        .pclk_hz = LCD_PCLK_HZ,
+        .trans_queue_depth = 10,
+        .on_color_trans_done = color_trans_done,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_SPI_HOST, &io_config, &io_handle));
+
+    line_buf[0] = heap_caps_malloc(LCD_WIDTH * 2 * PARALLEL_LINES, MALLOC_CAP_DMA);
+    line_buf[1] = heap_caps_malloc(LCD_WIDTH * 2 * PARALLEL_LINES, MALLOC_CAP_DMA);
+    buf_free_sem = xSemaphoreCreateCounting(2, 2);
+
+    for (size_t i = 0; i < sizeof(ili9341v_init_seq) / sizeof(ili9341v_init_seq[0]); i++) {
+        const lcd_init_cmd_t *c = &ili9341v_init_seq[i];
+        esp_lcd_panel_io_tx_param(io_handle, c->cmd, c->len ? c->data : NULL, c->len);
+        if (c->delay_ms) vTaskDelay(pdMS_TO_TICKS(c->delay_ms));
+    }
+
+    backlight_init();
+}
+
+/*
+** 8x8 font -- only the glyphs the control overlay needs (A, B, S, E, and 4 arrows).
+*/
+static const uint8_t font8x8[128][8] = {
+    ['A'] = {0x18, 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x00},
+    ['B'] = {0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00},
+    ['E'] = {0x7E, 0x60, 0x60, 0x78, 0x60, 0x60, 0x7E, 0x00},
+    ['S'] = {0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00},
+    [GLYPH_ARROW_UP]    = {0x18, 0x3C, 0x7E, 0x18, 0x18, 0x18, 0x18, 0x00},
+    [GLYPH_ARROW_DOWN]  = {0x18, 0x18, 0x18, 0x18, 0x7E, 0x3C, 0x18, 0x00},
+    [GLYPH_ARROW_LEFT]  = {0x08, 0x18, 0x38, 0x7C, 0x7C, 0x38, 0x18, 0x08},
+    [GLYPH_ARROW_RIGHT] = {0x10, 0x18, 0x1C, 0x3E, 0x3E, 0x1C, 0x18, 0x10},
+};
+
+void ili9341_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale)
+{
+    uint16_t sfg = (fg >> 8) | (fg << 8);
+    uint16_t sbg = (bg >> 8) | (bg << 8);
+    uint16_t w = 8 * scale, h = 8 * scale;
+    uint16_t buf[8 * 8 * 4]; // supports up to scale=2 (16x16); callers use scale<=2
+
+    const uint8_t *glyph = font8x8[(unsigned char)c & 0x7F];
+    for (int gy = 0; gy < 8; gy++) {
+        for (int sy = 0; sy < scale; sy++) {
+            int row = gy * scale + sy;
+            for (int gx = 0; gx < 8; gx++) {
+                uint16_t px = (glyph[gy] & (0x80 >> gx)) ? sfg : sbg;
+                for (int sx = 0; sx < scale; sx++) {
+                    buf[row * w + gx * scale + sx] = px;
                 }
-                x1 = myPalette[(unsigned char)(data[y][x])]; x++;
-                y1 = myPalette[(unsigned char)(data[y][x])]; x++;
-                temp[i] = U16x2toU32(x1,y1);
             }
-            while (READ_PERI_REG(SPI_CMD_REG(SPI_NUM))&SPI_USR);
-            for (i=0; i<16; i++) {
-                WRITE_PERI_REG((SPI_W0_REG(SPI_NUM) + (i << 2)), temp[i]);
-            }
-            SET_PERI_REG_MASK(SPI_CMD_REG(SPI_NUM), SPI_USR);
         }
     }
-    while (READ_PERI_REG(SPI_CMD_REG(SPI_NUM))&SPI_USR);
+
+    set_window(x, y, x + w - 1, y + h - 1);
+    // Drain both pool tokens first so no line_buf transfer is in flight concurrently,
+    // then wait for our own transfer's completion callback before returning, since
+    // `buf` is stack-allocated and must not go out of scope mid-DMA.
+    xSemaphoreTake(buf_free_sem, portMAX_DELAY);
+    xSemaphoreTake(buf_free_sem, portMAX_DELAY);
+    esp_lcd_panel_io_tx_color(io_handle, 0x2C, buf, (size_t)w * h * 2);
+    xSemaphoreTake(buf_free_sem, portMAX_DELAY);
+    xSemaphoreGive(buf_free_sem);
+    xSemaphoreGive(buf_free_sem);
 }
-
-void ili9341_init()
-{
-    spi_master_init();
-    ili_gpio_init();
-    ILI9341_INITIAL ();
-}
-
-
-
-
-

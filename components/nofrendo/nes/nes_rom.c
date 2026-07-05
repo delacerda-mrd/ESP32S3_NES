@@ -465,9 +465,9 @@ rominfo_t *rom_load(const char *filename)
    if (rom_allocsram(rominfo))
       goto _fail;
 
-      rom_loadtrainer(&rom, rominfo);
+   rom_loadtrainer(&rom, rominfo);
 
-	if (rom_loadrom(&rom, rominfo))
+   if (rom_loadrom(&rom, rominfo))
       goto _fail;
 
    rom_loadsram(rominfo);

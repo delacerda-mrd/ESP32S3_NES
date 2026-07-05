@@ -1,8 +1,9 @@
-ESP32-NESEMU, a Nintendo Entertainment System emulator for the ESP32
-====================================================================
+ESP32-NESEMU, a Nintendo Entertainment System emulator for the ESP32-S3
+========================================================================
 
-This is a quick and dirty port of Nofrendo, a Nintendo Entertainment System emulator. It lacks sound, but can emulate a NES at close
-to full speed, albeit with some framedrop due to the way the display is driven.
+This is a port of Nofrendo, a Nintendo Entertainment System emulator, targeting the
+QDtech ES3C28P (ESP32-S3R8, 2.8" ILI9341V IPS LCD, FT6336G capacitive touch, ES8311
+audio codec). On-screen touch controls replace the original PSX-controller input.
 
 Warning
 -------
@@ -13,56 +14,51 @@ This is a proof-of-concept and not an official application note. As such, this c
 Compiling
 ---------
 
-This code is an esp-idf project. You will need esp-idf to compile it. Newer versions of esp-idf may introduce incompatibilities with this code;
-for your reference, the code was tested against commit 12caaed28063e32d8b1fb13e13548b6fa52f87b3 of esp-idf.
+This code is an ESP-IDF v5.x CMake project, targeting the esp32s3 chip::
+
+    idf.py set-target esp32s3
+    idf.py build
+
+The build pulls in the ``espressif/es8311`` component via the IDF Component Manager.
+
+
+Flashing
+--------
+
+The board has no UART bridge -- it uses the ESP32-S3's native USB-CDC, appearing as
+``/dev/ttyACM0`` on Linux. Hold BOOT while plugging in USB (or while pressing RESET) to
+enter download mode if needed::
+
+    idf.py -p /dev/ttyACM0 flash monitor
 
 
 Display
 -------
 
-To display the NES output, please connect a 320x240 ili9341-based SPI display to the ESP32 in this way:
+Fixed to the ES3C28P's onboard 320x240 landscape ILI9341V IPS SPI LCD (CS=10, DC=46,
+SCLK=12, MOSI=11, MISO=13, BL=45; RST is tied to the chip's own reset line).
 
-    =====  =======================
-    Pin    GPIO
-    =====  =======================
-    MISO   25
-    MOSI   23
-    CLK    19
-    CS     22
-    DC     21
-    RST    18
-    BCKL   5
-    =====  =======================
-
-(BCKL = backlight enable)
-
-Also connect the power supply and ground. For now, the LCD is controlled using a SPI peripheral, fed using the 2nd CPU. This is less than ideal; feeding
-the SPI controller using DMA is better, but was left out due to this being a proof of concept.
+The 256px-wide NES frame is drawn at x=48 on the 320-wide screen. The remaining space
+is used for on-screen controls: a 48px D-pad bar on the left, and a 16px A/B/Start/Select
+button bar on the right, both drawn once at startup and driven by the capacitive
+touch panel (FT6336G, I2C address 0x38).
 
 
-Controller
-----------
+Audio
+-----
 
-To control the NES, connect a Playstation 1 or 2 controller as such:
+ES8311 codec (I2C address 0x18) + I2S, driving the onboard FM8002E amplifier
+(enabled via GPIO1, active low).
 
-    =====  =====
-    Pin    GPIO
-    =====  =====
-    CLK    14
-    DAT    27
-    ATT    16
-    CMD    2
-    =====  =====
-
-Also connect the power and ground lines. Most PS1/PS2 controllers work fine from a 3.3V power supply, if a 5V one is unavailable.
 
 ROM
 ---
-This NES emulator does not come with a ROM. Please supply your own and flash to address 0x00100000. You can use the flashrom.sh script as a template for doing so.
+This NES emulator does not come with a ROM. Please supply your own and flash to address
+0x00100000 using ``flashrom.sh <rom.nes>``.
+
 
 Copyright
 ---------
 
 Code in this repository is Copyright (C) 2016 Espressif Systems, licensed under the Apache License 2.0 as described in the file LICENSE. Code in the
 components/nofrendo is Copyright (c) 1998-2000 Matthew Conte (matt@conte.com) and licensed under the GPLv2.
-
