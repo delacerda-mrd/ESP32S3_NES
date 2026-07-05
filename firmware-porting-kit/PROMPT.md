@@ -6,9 +6,17 @@ steps exactly.
 
 ## Step 1 — Gather facts
 
-Inspect the repo first (build files, existing configs, source tree) and extract
-whatever you can without asking. Then interview the user ONLY for what you could
-not determine. Required facts:
+**Check the board library first**: `firmware-porting-kit/boards/` contains
+complete, verified references for boards the user owns. Ask which board this
+port targets (or infer it from the repo) and, if a matching reference exists,
+treat it as the PRIMARY source for all hardware facts — pin maps, addresses,
+init sequences, known quirks. Skip interview questions the reference already
+answers. Copy it into the project as `docs/BOARD_REFERENCE.md` and make the
+instantiated `docs/HARDWARE.md` a thin summary that points into it.
+
+Then inspect the repo (build files, existing configs, source tree) and extract
+whatever you can without asking. Interview the user ONLY for what remains.
+Required facts:
 
 - **Target hardware**: board name, MCU/SoC (exact variant), flash size/type, RAM/PSRAM
 - **What's being ported**: the firmware/app, and where it came from (upstream repo, previous board)

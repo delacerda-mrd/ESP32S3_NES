@@ -33,6 +33,25 @@ re-explain context.
 
 That's it. From then on, every session: state your goal; say "wrap up" when done.
 
+## Board library (`boards/`)
+
+Complete, verified hardware references for boards you own — full pin maps, I2C
+addresses, init sequences, and known quirks. During bootstrap, Claude checks this
+folder first: if the target board is here, it copies the reference into the
+project (`docs/BOARD_REFERENCE.md`) and skips the hardware interview almost
+entirely.
+
+Currently in the library:
+- **ES3C28P** — QDtech 2.8" ESP32-S3R8 IPS display module (ILI9341V, FT6336G
+  capacitive touch, ES8311 audio, SDIO microSD, battery mgmt)
+- **ESP32-2432S028 "CYD"** — Sunton Cheap Yellow Display, 2.8" ESP32 (ILI9341,
+  XPT2046 resistive touch, DAC audio, SPI microSD)
+
+**Add every new board you acquire**: drop a `<BOARD>_BOARD_REFERENCE.md` here
+following the same structure (SoC → display → touch → audio → storage → complete
+GPIO allocation table → flashing procedure). The complete GPIO table is the most
+valuable section — it's what prevents pin-conflict debugging.
+
 ## The document architecture (why it's shaped this way)
 
 | File | Loaded | Contains |
