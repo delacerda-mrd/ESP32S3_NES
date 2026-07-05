@@ -469,7 +469,7 @@ int light = analogRead(34);  // 0-4095, higher = brighter
 
 ---
 
-## 17. Key Differences from ES3C28P (Elecrow 2.8")
+## 17. Key Differences from ES3C28P (QDtech 2.8")
 
 | Feature | CYD (ESP32-2432S028) | ES3C28P |
 |---------|---------------------|---------|
