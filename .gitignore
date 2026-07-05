@@ -3,3 +3,4 @@ sdkconfig.old
 *.nes
 managed_components/
 
+.DS_Store

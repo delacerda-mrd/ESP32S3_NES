@@ -23,14 +23,31 @@ and resume without re-explaining anything to Claude.
 
 ## How to use it (your part is tiny)
 
-**Resuming after time away:** just start `claude` in this directory and state your
-goal ("let's keep debugging the LCD"). CLAUDE.md auto-loads, tells Claude to read
-the journal, and it picks up where the status block left off.
+**Resuming after time away (on either machine):** just start `claude` in this
+directory and state your goal ("let's keep debugging the LCD"). CLAUDE.md
+auto-loads, tells Claude to first `git pull` (to get journal updates from the
+other machine) and then read the journal, picking up where the status block left off.
 
 **Ending a work session:** say **"wrap up"** or **"update the journal"** before you
-stop. Claude refreshes the Current Status block and appends a dated entry.
+stop. Claude refreshes the Current Status block, appends a dated entry, and
+**commits + pushes the journal to origin** so your other machine sees it.
 If you forget, ask at the start of the next session: "did we log last session?
 Reconstruct from git diff if not."
+
+## Working across your Mac and Linux machines
+
+Git is the sync channel — nothing outside the repo carries state between machines.
+
+- **Journal updates are always pushed at wrap-up** (code changes still only on request).
+- **Session start always pulls** before reading the journal.
+- If both machines edited the journal without syncing, the merge rule is:
+  keep all session entries from both sides, reconcile Current Status by date.
+- Claude's private auto-memory (`~/.claude/projects/...`) is **machine-local** and
+  treated as a convenience only — the repo docs are the source of truth, so nothing
+  is lost when you switch machines.
+- Serial port differs per machine: `/dev/cu.usbmodem*` (Mac) vs `/dev/ttyACM0` (Linux).
+- After switching machines, if the build misbehaves, run `idf.py fullclean` —
+  `build/` artifacts and IDF versions can differ between installs.
 
 ## The files
 
