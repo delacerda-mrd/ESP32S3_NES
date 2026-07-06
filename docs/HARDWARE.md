@@ -1,6 +1,6 @@
 # Hardware Reference — QDtech ES3C28P
 
-> **Full board reference:** `firmware-porting-kit/boards/ES3C28P_BOARD_REFERENCE.md`
+> **Full board reference:** `docs/BOARD_REFERENCE.md`
 > has the complete verified spec — every GPIO, ILI9341V init sequence with gamma
 > tables, FT6336G register map, MADCTL rotation values, battery ADC formula,
 > SD/SDIO pins, expansion headers. Consult it before asking the user or guessing.
